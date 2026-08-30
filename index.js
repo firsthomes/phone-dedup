@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const { handleComparePrimary } = require('./compare-primary-duplicate');
 const crypto = require('crypto');
 const axios = require('axios');
 
@@ -141,6 +142,8 @@ app.post('/webhooks/contact-normalized', (req, res) => {
     });
   });
 });
+
+app.post('/webhooks/compare-primary', handleComparePrimary);
 
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
