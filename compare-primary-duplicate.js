@@ -50,7 +50,7 @@ const AIRCALL_LAST_CALL_PROPERTY = 'aircall_last_call_at';
 const HIGHER_RANK_IS_BETTER = true;
 
 function isValidSignature(req) {
-  const secret = process.env.WEBHOOK_SECRET;
+  const secret = process.env.WORKFLOW_WEBHOOK_SECRET;
   const provided = req.headers['x-webhook-secret'];
 
   if (process.env.DEBUG_WEBHOOK === 'true') {
