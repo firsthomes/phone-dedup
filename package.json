@@ -1,0 +1,19 @@
+{
+  "name": "hubspot-dedup-app",
+  "version": "1.0.0",
+  "description": "Function 1 - receives HubSpot contact.creation webhooks and tags duplicates",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "@hubspot/api-client": "^14.0.1",
+    "axios": "^1.7.2",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  }
+}
