@@ -126,7 +126,7 @@ async function handleComparePrimary(req, res) {
       totals[c.id] = Number(c.properties.primary_contact_score) || 0;
     });
 
-    // Criterion A: highest deal stage rank (+50)
+    // Criterion A: highest deal stage rank (+16)
     const rankWinner = group.reduce((best, c) => {
       const val = Number(c.properties[DEAL_STAGE_RANK_PROPERTY]);
       if (Number.isNaN(val)) return best;
@@ -137,7 +137,7 @@ async function handleComparePrimary(req, res) {
     }, null);
     if (rankWinner) totals[rankWinner.id] += BONUS.dealStageRank;
 
-    // Criterion B: most recent Aircall call timestamp (+30)
+    // Criterion B: most recent Aircall call timestamp (+4)
     const callWinner = group.reduce((best, c) => {
       const val = new Date(c.properties[AIRCALL_LAST_CALL_PROPERTY] || 0).getTime();
       if (!val) return best;
@@ -147,7 +147,7 @@ async function handleComparePrimary(req, res) {
     }, null);
     if (callWinner) totals[callWinner.id] += BONUS.latestCall;
 
-    // Criterion C: created first / earliest createdate (+20)
+    // Criterion C: created first / earliest createdate (+1)
     const createdWinner = group.reduce((best, c) => {
       const val = new Date(c.properties.createdate).getTime();
       if (!best) return c;
