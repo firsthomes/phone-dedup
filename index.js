@@ -3,6 +3,8 @@ const express = require('express');
 const { handleComparePrimary } = require('./compare-primary-duplicate');
 const crypto = require('crypto');
 const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.set('trust proxy', true); // Required behind ngrok/Railway so req.protocol reports https correctly
@@ -12,6 +14,8 @@ const hubspot = axios.create({
   baseURL: 'https://api.hubapi.com',
   headers: { Authorization: `Bearer ${ACCESS_TOKEN}` },
 });
+
+const AUDIT_LOG_PATH = path.join(__dirname, 'audit-snapshots.log');
 
 async function fetchContact(contactId) {
   const res = await hubspot.get(`/crm/v3/objects/contacts/${contactId}`, {
@@ -144,6 +148,21 @@ app.post('/webhooks/contact-normalized', (req, res) => {
 });
 
 app.post('/webhooks/compare-primary', handleComparePrimary);
+
+app.post('/internal/audit-snapshot', (req, res) => {
+  if (!isValidWebhookSecret(req)) {
+    return res.status(401).json({ error: 'Invalid signature' });
+  }
+
+  const entry = JSON.stringify(req.body) + '\n';
+  fs.appendFile(AUDIT_LOG_PATH, entry, (err) => {
+    if (err) {
+      console.error('Failed to write audit snapshot:', err.message);
+      return res.status(500).json({ error: 'Failed to persist snapshot' });
+    }
+    return res.status(200).json({ status: 'ok' });
+  });
+});
 
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
