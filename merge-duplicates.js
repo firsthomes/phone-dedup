@@ -2,7 +2,7 @@
  * FUNCTION 4 — Merge Duplicates into Primary
  * HubSpot Workflow Custom Code Action
  * Runtime: Node.js 16+
- * Dependency: @hubspot/api-client
+ * Dependency: @hubspot/api-client, axios
  *
  * ENROLLMENT: Enroll on the PRIMARY contact
  * (workflow trigger: duplicate_status = "Primary Duplicate").
@@ -18,8 +18,10 @@
  *   primaryContactId -> contact.hs_object_id
  *   dryRun           -> contact.merge_dry_run  (string "true"/"false", optional)
  *
- * REQUIRED SECRET (set in Custom Code action > Secrets):
+ * REQUIRED SECRETS (set in Custom Code action > Secrets):
  *   HUBSPOT_ACCESS_TOKEN
+ *   WORKFLOW_WEBHOOK_SECRET
+ *   AUDIT_ENDPOINT_URL
  *
  * OUTPUT FIELDS (available to later workflow steps):
  *   merge_status      -> "merged" | "partial_error" | "no_duplicates_found" | "skipped_dry_run" | "error"
@@ -29,6 +31,7 @@
  */
 
 const hubspot = require('@hubspot/api-client');
+const axios = require('axios');
 
 // Matches the constant name used in compare-primary-duplicate.js (Function 3).
 const AIRCALL_LAST_CALL_PROPERTY = 'aircall_last_call_at';
@@ -49,6 +52,9 @@ const PROPERTIES_TO_SNAPSHOT = [
   'createdate',
   'duplicate_status'
 ];
+
+const AUDIT_ENDPOINT = process.env.AUDIT_ENDPOINT_URL;
+const WEBHOOK_SECRET = process.env.WORKFLOW_WEBHOOK_SECRET;
 
 exports.main = async (event, callback) => {
   const { primaryContactId, dryRun } = event.inputFields;
@@ -110,14 +116,24 @@ exports.main = async (event, callback) => {
     }
 
     // --- 3. Snapshot everything before touching anything ---
-    // Replace this console.log with a write to your logging store
-    // (Express app endpoint, a HubSpot custom object, or external DB).
-    console.log(JSON.stringify({
-      event: 'pre_merge_snapshot',
-      timestamp: new Date().toISOString(),
-      primary: primaryRecord.properties,
-      duplicates: duplicates.map((d) => d.properties)
-    }));
+    // POSTs to the Express app's audit endpoint. Wrapped in its own
+    // try/catch so a logging failure never blocks the actual merge.
+    try {
+      await axios.post(AUDIT_ENDPOINT, {
+        event: 'pre_merge_snapshot',
+        timestamp: new Date().toISOString(),
+        primary: primaryRecord.properties,
+        duplicates: duplicates.map((d) => d.properties)
+      }, {
+        headers: { 'x-webhook-secret': WEBHOOK_SECRET }
+      });
+    } catch (err) {
+      console.error(JSON.stringify({
+        event: 'audit_snapshot_failed',
+        primaryContactId,
+        error: err.message || String(err)
+      }));
+    }
 
     if (isDryRun) {
       result.merge_status = 'skipped_dry_run';
