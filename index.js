@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const { handleComparePrimary } = require('./compare-primary-duplicate');
+const { handleMergeDuplicates } = require('./merge-duplicates');
 const crypto = require('crypto');
 const axios = require('axios');
 const fs = require('fs');
@@ -122,32 +123,37 @@ function isValidWebhookSecret(req) {
   return crypto.timingSafeEqual(providedBuffer, expectedBuffer);
 }
 
-app.post('/webhooks/contact-normalized', (req, res) => {
-  // Respond immediately — same reasoning as before, ack fast and process after
-  res.status(200).send('OK');
+app.post('/webhooks/contact-normalized', async (req, res) => {
+  if (!isValidWebhookSecret(req)) {
+    return res.status(401).send('Invalid signature');
+  }
 
-  if (!isValidWebhookSecret(req)) return;
-
-  const contactId = req.body?.contactID;
+  const contactId = req.body?.contactId;
 
   if (!contactId) {
-    console.warn('Rejected: payload had no contactID', req.body);
-    return;
+    console.warn('Rejected: payload had no contactId', req.body);
+    return res.status(400).send('Missing contactId');
   }
 
   console.log('Workflow webhook received for contact:', contactId);
 
-  processContactForDuplicates(String(contactId)).catch((err) => {
+  try {
+    await processContactForDuplicates(String(contactId));
+    return res.status(200).send('OK');
+  } catch (err) {
     console.error(`Failed to process contact ${contactId}:`, {
       status: err.response?.status,
       url: err.config?.url,
       data: err.response?.data,
       message: err.message,
     });
-  });
+    return res.status(500).send('Processing failed');
+  }
 });
 
 app.post('/webhooks/compare-primary', handleComparePrimary);
+
+app.post('/webhooks/merge-duplicates', handleMergeDuplicates);
 
 app.post('/internal/audit-snapshot', (req, res) => {
   if (!isValidWebhookSecret(req)) {
