@@ -1,37 +1,69 @@
 /**
- * FUNCTION 4 — Merge Duplicates into Primary
- * HubSpot Workflow Custom Code Action
- * Runtime: Node.js 16+
- * Dependency: @hubspot/api-client, axios
+ * Function 4 — Merge Duplicates into Primary
+ * Express route handler (same app as Functions 1 and 3)
  *
- * ENROLLMENT: Enroll on the PRIMARY contact
- * (workflow trigger: duplicate_status = "Primary Duplicate").
+ * TRIGGERED BY: HubSpot Workflow "Send a webhook" action, enrolled on the
+ * PRIMARY contact (workflow trigger: duplicate_status = "Primary Duplicate").
+ * Moved out of Custom Code because HubSpot automatically unenrolls any
+ * record involved in a merge — even the surviving primary — which killed
+ * a Custom Code execution mid-loop after the first merge. Running this as
+ * a plain Express handler means the merge loop is no longer tied to the
+ * workflow's enrollment lifecycle at all.
  *
- * The primary's duplicate(s) are NOT passed in as input fields — they're
- * discovered by looking up the association Function 1 created between
- * the primary and every contact sharing its phone number, then filtering
- * to whichever of those are actually tagged duplicate_status = "Duplicate".
- * This lets one enrollment handle groups of any size (2, 3, 10+ duplicates)
- * in a single run, rather than firing once per duplicate.
+ * Since the workflow only sends the webhook and doesn't wait for a
+ * response, this acks immediately and processes the merge async — same
+ * pattern as Function 1. Results are written back to HubSpot as contact
+ * properties (merge_status, merge_error, merged_count) rather than
+ * returned as Custom Code output fields, so a separate workflow branch
+ * (triggered on merge_status changing) can pick them up for the error
+ * email notification.
  *
- * REQUIRED WORKFLOW INPUT FIELDS (map these in the workflow UI):
- *   primaryContactId -> contact.hs_object_id
- *   dryRun           -> contact.merge_dry_run  (string "true"/"false", optional)
+ * Merge itself is called directly via axios against HubSpot's REST API
+ * (rather than the @hubspot/api-client SDK's publicObjectApi.merge),
+ * since that SDK path was undefined in the installed version.
  *
- * REQUIRED SECRETS (set in Custom Code action > Secrets):
+ * CANONICAL ID TRACKING: HubSpot generates a new canonical record ID on
+ * merge rather than always preserving the original primaryObjectId
+ * literally. After every successful merge, the ID returned in the API
+ * response is captured and used as the primary for all subsequent
+ * merges in the same group — otherwise, merging a group of 3+ duplicates
+ * would fail on the second merge, since the ID used for the first merge
+ * may no longer be the live canonical one.
+ *
+ * ASSOCIATION DISCOVERY: this function reads the primary's direct
+ * associations via a single lookup, rather than traversing the group.
+ * This is safe because Function 3 associates every duplicate directly
+ * to the winner (not just to whichever contact happened to trigger
+ * Function 1) before writing duplicate_status = "Primary Duplicate" —
+ * so by the time this function runs, the primary is always directly
+ * linked to every other group member, regardless of the original
+ * hub-and-spoke shape Function 1 created.
+ *
+ * WEBHOOK PAYLOAD EXPECTED:
+ *   { "primaryContactId": "{{contact.hs_object_id}}", "dryRun": "false" }
+ *
+ * ENV VARS REQUIRED:
  *   HUBSPOT_ACCESS_TOKEN
  *   WORKFLOW_WEBHOOK_SECRET
  *   AUDIT_ENDPOINT_URL
  *
- * OUTPUT FIELDS (available to later workflow steps):
- *   merge_status      -> "merged" | "partial_error" | "no_duplicates_found" | "skipped_dry_run" | "error"
- *   merge_error       -> string, empty if none
- *   merged_count      -> number of duplicates successfully merged
- *   merged_primary_id -> string
+ * CONTACT PROPERTIES WRITTEN BACK TO PRIMARY:
+ *   merge_status  -> Dropdown select: merged | partial_error | no_duplicates_found | skipped_dry_run | error
+ *   merge_error   -> Single-line text
+ *   merged_count  -> Number
  */
 
+const crypto = require('crypto');
 const hubspot = require('@hubspot/api-client');
 const axios = require('axios');
+
+const hubspotClient = new hubspot.Client({
+  accessToken: process.env.HUBSPOT_ACCESS_TOKEN
+});
+
+const AUDIT_ENDPOINT = process.env.AUDIT_ENDPOINT_URL;
+const WEBHOOK_SECRET = process.env.WORKFLOW_WEBHOOK_SECRET;
+const ACCESS_TOKEN = process.env.HUBSPOT_ACCESS_TOKEN;
 
 // Matches the constant name used in compare-primary-duplicate.js (Function 3).
 const AIRCALL_LAST_CALL_PROPERTY = 'aircall_last_call_at';
@@ -53,17 +85,57 @@ const PROPERTIES_TO_SNAPSHOT = [
   'duplicate_status'
 ];
 
-const AUDIT_ENDPOINT = process.env.AUDIT_ENDPOINT_URL;
-const WEBHOOK_SECRET = process.env.WORKFLOW_WEBHOOK_SECRET;
+function isValidSignature(req) {
+  const provided = req.headers['x-webhook-secret'];
 
-exports.main = async (event, callback) => {
-  const { primaryContactId, dryRun } = event.inputFields;
-  const isDryRun = String(dryRun).toLowerCase() === 'true';
+  if (process.env.DEBUG_WEBHOOK === 'true') {
+    console.log('--- Merge webhook signature debug ---');
+    console.log('WORKFLOW_WEBHOOK_SECRET loaded:', WEBHOOK_SECRET ? `yes (length ${WEBHOOK_SECRET.length})` : 'NO — undefined');
+    console.log('x-webhook-secret header received:', provided ? `yes (length ${provided.length})` : 'NO — missing');
+    console.log('--------------------------------------');
+  }
 
-  const hubspotClient = new hubspot.Client({
-    accessToken: process.env.HUBSPOT_ACCESS_TOKEN
-  });
+  if (!WEBHOOK_SECRET || !provided) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(WEBHOOK_SECRET), Buffer.from(provided));
+  } catch {
+    return false; // lengths differ -> timingSafeEqual throws instead of returning false
+  }
+}
 
+async function writeResultToPrimary(primaryContactId, result) {
+  try {
+    await hubspotClient.crm.contacts.basicApi.update(primaryContactId, {
+      properties: {
+        merge_status: result.merge_status,
+        merge_error: result.merge_error,
+        merged_count: result.merged_count
+      }
+    });
+  } catch (err) {
+    // Don't let a failed status write throw further up — just log it.
+    console.error(JSON.stringify({
+      event: 'merge_result_write_failed',
+      primaryContactId,
+      error: err.message || String(err)
+    }));
+  }
+}
+
+async function preservePropertiesOnPrimary(primaryContactId, primaryRecord) {
+  const preserveUpdate = {};
+  for (const prop of PROPERTIES_TO_PRESERVE_ON_PRIMARY) {
+    const value = primaryRecord.properties[prop];
+    if (value) preserveUpdate[prop] = value;
+  }
+  if (Object.keys(preserveUpdate).length > 0) {
+    await hubspotClient.crm.contacts.basicApi.update(primaryContactId, {
+      properties: preserveUpdate
+    });
+  }
+}
+
+async function performMerge(primaryContactId, isDryRun) {
   const result = {
     merge_status: 'error',
     merge_error: '',
@@ -77,7 +149,9 @@ exports.main = async (event, callback) => {
     }
 
     // --- 1. Discover the duplicate group via the existing association ---
-    // Same association Function 1 created and Function 3 read from.
+    // Safe as a single-level lookup — see header comment on Association
+    // Discovery for why the primary is guaranteed to be directly linked
+    // to every other group member by this point.
     const assocResp = await hubspotClient.crm.associations.v4.basicApi.getPage(
       'contacts',
       primaryContactId,
@@ -89,7 +163,8 @@ exports.main = async (event, callback) => {
 
     if (associatedIds.length === 0) {
       result.merge_status = 'no_duplicates_found';
-      return callback({ outputFields: result });
+      await writeResultToPrimary(primaryContactId, result);
+      return result;
     }
 
     // --- 2. Batch-fetch primary + all associated contacts in ONE call ---
@@ -110,13 +185,16 @@ exports.main = async (event, callback) => {
       (r) => r.id !== primaryRecord.id && r.properties.duplicate_status === 'Duplicate'
     );
 
+    console.log('Duplicates captured:', duplicates.map((d) => d.id));
+
     if (duplicates.length === 0) {
       result.merge_status = 'no_duplicates_found';
-      return callback({ outputFields: result });
+      await writeResultToPrimary(primaryContactId, result);
+      return result;
     }
 
     // --- 3. Snapshot everything before touching anything ---
-    // POSTs to the Express app's audit endpoint. Wrapped in its own
+    // POSTs to the Express app's own audit endpoint. Wrapped in its own
     // try/catch so a logging failure never blocks the actual merge.
     try {
       await axios.post(AUDIT_ENDPOINT, {
@@ -138,53 +216,94 @@ exports.main = async (event, callback) => {
     if (isDryRun) {
       result.merge_status = 'skipped_dry_run';
       result.merged_count = duplicates.length;
-      return callback({ outputFields: result });
+      await writeResultToPrimary(primaryContactId, result);
+      return result;
     }
 
-    // --- 4. Re-assert the primary's own writable values before merging ---
-    // Only re-write properties actually populated on the primary, so we
-    // never overwrite a good value with a blank.
-    const preserveUpdate = {};
-    for (const prop of PROPERTIES_TO_PRESERVE_ON_PRIMARY) {
-      const value = primaryRecord.properties[prop];
-      if (value) preserveUpdate[prop] = value;
-    }
-    if (Object.keys(preserveUpdate).length > 0) {
-      await hubspotClient.crm.contacts.basicApi.update(primaryContactId, {
-        properties: preserveUpdate
-      });
-    }
-
-    // --- 5. Merge sequentially — the Merge API only accepts 2 IDs at a time ---
-    // Each merge is independent; one failing shouldn't stop the rest of the group.
+    // --- 4. Merge sequentially — the Merge API only accepts 2 IDs at a
+    // time. Each merge is independent; one failing shouldn't stop the
+    // rest of the group. After every successful merge, canonicalPrimaryId
+    // is updated to whatever ID HubSpot's response actually returns,
+    // since that may not be the same ID we started with (see header
+    // comment).
+    let canonicalPrimaryId = primaryContactId;
     let mergedCount = 0;
     const errors = [];
 
     for (const duplicate of duplicates) {
+      const attemptedPrimaryId = canonicalPrimaryId;
       try {
-        await mergeWithRetry(hubspotClient, primaryContactId, duplicate.id);
+        const returnedId = await mergeWithRetry(ACCESS_TOKEN, canonicalPrimaryId, duplicate.id);
         mergedCount += 1;
+
+        const idChanged = returnedId && returnedId !== canonicalPrimaryId;
+        if (idChanged) {
+          canonicalPrimaryId = returnedId;
+        }
+
+        console.log(JSON.stringify({
+          event: 'merge_result',
+          status: 'success',
+          primaryId: attemptedPrimaryId,
+          duplicateMergedId: duplicate.id,
+          newPrimaryId: canonicalPrimaryId
+        }));
       } catch (err) {
-        errors.push(`${duplicate.id}: ${err.message || String(err)}`);
-        console.error(JSON.stringify({
-          event: 'merge_failed',
-          primaryContactId,
-          duplicateContactId: duplicate.id,
-          error: err.message || String(err)
+        const errMsg = err.response?.data?.message || err.message || String(err);
+        errors.push(`${duplicate.id}: ${errMsg}`);
+
+        console.log(JSON.stringify({
+          event: 'merge_result',
+          status: 'fail',
+          primaryId: attemptedPrimaryId,
+          duplicateMergedId: duplicate.id,
+          newPrimaryId: attemptedPrimaryId,
+          error: errMsg
         }));
       }
     }
 
     result.merged_count = mergedCount;
+    result.merged_primary_id = canonicalPrimaryId;
+
+    // --- 5. Re-assert the primary's own writable values ---
+    // Uses the values captured from the original batch read, written onto
+    // whichever ID ended up being the actual canonical primary. Only
+    // re-write properties actually populated, so we never overwrite a
+    // good value with a blank.
+    try {
+      await preservePropertiesOnPrimary(canonicalPrimaryId, primaryRecord);
+    } catch (err) {
+      console.error(JSON.stringify({
+        event: 'preserve_properties_failed',
+        primaryContactId: canonicalPrimaryId,
+        error: err.message || String(err)
+      }));
+    }
 
     if (errors.length === 0) {
       result.merge_status = 'merged';
+
+      // All duplicates merged successfully — the primary is no longer
+      // part of an active duplicate group, so clear its status.
+      try {
+        await hubspotClient.crm.contacts.basicApi.update(canonicalPrimaryId, {
+          properties: { duplicate_status: 'Non-duplicate' }
+        });
+      } catch (err) {
+        console.error(JSON.stringify({
+          event: 'primary_status_reset_failed',
+          primaryContactId: canonicalPrimaryId,
+          error: err.message || String(err)
+        }));
+      }
     } else {
       result.merge_status = mergedCount > 0 ? 'partial_error' : 'error';
       result.merge_error = errors.join(' | ');
     }
 
-    return callback({ outputFields: result });
+    await writeResultToPrimary(canonicalPrimaryId, result);
+    return result;
 
   } catch (err) {
     result.merge_error = err.message || String(err);
@@ -193,22 +312,62 @@ exports.main = async (event, callback) => {
       primaryContactId,
       error: result.merge_error
     }));
-    return callback({ outputFields: result });
+    await writeResultToPrimary(primaryContactId, result);
+    return result;
   }
-};
+}
 
-async function mergeWithRetry(client, primaryId, duplicateId, attempt = 1) {
+// Returns the surviving contact's ID as reported by HubSpot's merge
+// response, so the caller can keep merging subsequent duplicates against
+// the correct, current canonical record.
+async function mergeWithRetry(accessToken, primaryId, duplicateId, attempt = 1) {
   try {
-    await client.crm.contacts.publicObjectApi.merge({
-      primaryObjectId: primaryId,
-      objectIdToMerge: duplicateId
-    });
+    const response = await axios.post(
+      'https://api.hubapi.com/crm/v3/objects/contacts/merge',
+      {
+        primaryObjectId: primaryId,
+        objectIdToMerge: duplicateId
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    return response.data?.id ? String(response.data.id) : primaryId;
   } catch (err) {
-    if (err.code === 429 && attempt <= 3) {
+    if (err.response?.status === 429 && attempt <= 3) {
       const backoffMs = attempt * 1000;
       await new Promise((resolve) => setTimeout(resolve, backoffMs));
-      return mergeWithRetry(client, primaryId, duplicateId, attempt + 1);
+      return mergeWithRetry(accessToken, primaryId, duplicateId, attempt + 1);
     }
     throw err;
   }
 }
+
+async function handleMergeDuplicates(req, res) {
+  // Ack immediately — same reasoning as Function 1. HubSpot's webhook
+  // action doesn't wait for or read the response body, and a sequential
+  // merge loop with retries could exceed HubSpot's webhook timeout.
+  res.status(200).send('OK');
+
+  if (!isValidSignature(req)) {
+    console.warn('Rejecting merge request: invalid signature');
+    return;
+  }
+
+  const { primaryContactId, dryRun } = req.body || {};
+  const isDryRun = String(dryRun).toLowerCase() === 'true';
+
+  if (!primaryContactId) {
+    console.warn('Rejected: payload had no primaryContactId', req.body);
+    return;
+  }
+
+  performMerge(String(primaryContactId), isDryRun).catch((err) => {
+    console.error(`Unhandled error merging primary ${primaryContactId}:`, err.message || String(err));
+  });
+}
+
+module.exports = { handleMergeDuplicates };
