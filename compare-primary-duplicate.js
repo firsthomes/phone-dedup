@@ -18,6 +18,11 @@
  * perspective) could miss group members if the winner turned out to be a
  * spoke rather than the hub.
  *
+ * TIE HANDLING: criteria 2, 4, and 6 each award their bonus to a single
+ * "best" contact in the group. If two or more contacts are exactly tied
+ * on that criterion, NO ONE receives the bonus — it is not awarded based
+ * on response order or which contact happened to trigger the webhook.
+ *
  * WEBHOOK PAYLOAD EXPECTED (configure in the workflow's webhook body):
  *   { "contactId": "{{contact.hs_object_id}}" }
  *
@@ -108,6 +113,29 @@ async function associateContacts(contactIdA, contactIdB) {
   );
 }
 
+// Awards a bonus to the single contact with the best value for a given
+// numeric extractor function. If two or more contacts tie for the best
+// value, no one receives the bonus — avoids silently deciding ties based
+// on array/response order.
+function awardBonusToSoleBest(group, totals, bonusAmount, getValue, higherIsBetter) {
+  const candidates = group
+    .map((c) => ({ contact: c, value: getValue(c) }))
+    .filter((entry) => entry.value !== null && !Number.isNaN(entry.value));
+
+  if (candidates.length === 0) return;
+
+  const bestValue = higherIsBetter
+    ? Math.max(...candidates.map((entry) => entry.value))
+    : Math.min(...candidates.map((entry) => entry.value));
+
+  const leaders = candidates.filter((entry) => entry.value === bestValue);
+
+  if (leaders.length === 1) {
+    totals[leaders[0].contact.id] += bonusAmount;
+  }
+  // If leaders.length > 1, it's a tie — no bonus awarded to anyone.
+}
+
 async function handleComparePrimary(req, res) {
   if (!isValidSignature(req)) {
     return res.status(401).json({ error: 'Invalid signature' });
@@ -172,16 +200,17 @@ async function handleComparePrimary(req, res) {
       }
     });
 
-    // Criterion 2: highest deal stage number in group (+16)
-    const rankWinner = group.reduce((best, c) => {
-      const val = Number(c.properties[DEAL_STAGE_RANK_PROPERTY]);
-      if (Number.isNaN(val)) return best;
-      if (!best) return c;
-      const bestVal = Number(best.properties[DEAL_STAGE_RANK_PROPERTY]);
-      const cIsBetter = HIGHER_RANK_IS_BETTER ? val > bestVal : val < bestVal;
-      return cIsBetter ? c : best;
-    }, null);
-    if (rankWinner) totals[rankWinner.id] += BONUS.dealStageRank;
+    // Criterion 2: highest deal stage number in group (+16). No bonus if tied.
+    awardBonusToSoleBest(
+      group,
+      totals,
+      BONUS.dealStageRank,
+      (c) => {
+        const val = Number(c.properties[DEAL_STAGE_RANK_PROPERTY]);
+        return Number.isNaN(val) ? null : val;
+      },
+      HIGHER_RANK_IS_BETTER
+    );
 
     // Criterion 3: owner matched (+8) — per-contact
     group.forEach((c) => {
@@ -189,29 +218,38 @@ async function handleComparePrimary(req, res) {
       if (matched) totals[c.id] += BONUS.ownerMatched;
     });
 
-    // Criterion 4: most recent Aircall call timestamp (+4)
-    const callWinner = group.reduce((best, c) => {
-      const val = new Date(c.properties[AIRCALL_LAST_CALL_PROPERTY] || 0).getTime();
-      if (!val) return best;
-      if (!best) return c;
-      const bestVal = new Date(best.properties[AIRCALL_LAST_CALL_PROPERTY] || 0).getTime();
-      return val > bestVal ? c : best;
-    }, null);
-    if (callWinner) totals[callWinner.id] += BONUS.latestCall;
+    // Criterion 4: most recent Aircall call timestamp (+4). No bonus if tied.
+    awardBonusToSoleBest(
+      group,
+      totals,
+      BONUS.latestCall,
+      (c) => {
+        const raw = c.properties[AIRCALL_LAST_CALL_PROPERTY];
+        if (!raw) return null;
+        const val = new Date(raw).getTime();
+        return Number.isNaN(val) ? null : val;
+      },
+      true // higher (more recent) is better
+    );
 
     // Criterion 5: email known (+2) — per-contact
     group.forEach((c) => {
       if (c.properties.email) totals[c.id] += BONUS.emailKnown;
     });
 
-    // Criterion 6: created first / earliest createdate (+1)
-    const createdWinner = group.reduce((best, c) => {
-      const val = new Date(c.properties.createdate).getTime();
-      if (!best) return c;
-      const bestVal = new Date(best.properties.createdate).getTime();
-      return val < bestVal ? c : best;
-    }, null);
-    if (createdWinner) totals[createdWinner.id] += BONUS.createdFirst;
+    // Criterion 6: created first / earliest createdate (+1). No bonus if tied.
+    awardBonusToSoleBest(
+      group,
+      totals,
+      BONUS.createdFirst,
+      (c) => {
+        const raw = c.properties.createdate;
+        if (!raw) return null;
+        const val = new Date(raw).getTime();
+        return Number.isNaN(val) ? null : val;
+      },
+      false // lower (earlier) is better
+    );
 
     // 4. Determine overall winner (highest total). Tie-break: earliest createdate.
     let winner = null;
